@@ -36,7 +36,7 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 		return fmt.Errorf("unable to convert Namespace to RepositoryEnumerator")
 	}
 
-	// enumerate in parallel
+	// process in parallel
 	const concurrencyLimit = 100
 	var markSetMtx sync.Mutex
 	var deleteLayerSetMtx sync.Mutex
@@ -184,20 +184,32 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 	manifestArr = unmarkReferencedManifest(manifestArr, markSet)
 
 	// sweep
+	deleteManifestG, _ := errgroup.WithContext(context.Background())
+	deleteManifestG.SetLimit(concurrencyLimit)
 	vacuum := NewVacuum(ctx, storageDriver)
 	if !opts.DryRun {
 		for _, obj := range manifestArr {
-			err = vacuum.RemoveManifest(obj.Name, obj.Digest, obj.Tags)
-			if err != nil {
-				emit("failed to delete manifest %s: %v", obj.Digest, err)
-			}
+			func(obj ManifestDel) {
+				deleteManifestG.Go(func() error {
+					err = vacuum.RemoveManifest(obj.Name, obj.Digest, obj.Tags)
+					if err != nil {
+						emit("failed to delete manifest %s: %v", obj.Digest, err)
+					}
+					return nil
+				})
+			}(obj)
 		}
 	}
+	if err := deleteManifestG.Wait(); err != nil {
+		emit("error deleting manifests: %v", err)
+	}
+
 	blobService := registry.Blobs()
 	deleteSet := make(map[digest.Digest]struct{})
 	err = blobService.Enumerate(ctx, func(dgst digest.Digest) error {
 		// check if digest is in markSet. If not, delete it!
 		if _, ok := markSet[dgst]; !ok {
+			emit("blob eligible for deletion: %s", dgst)
 			deleteSet[dgst] = struct{}{}
 		}
 		return nil
@@ -206,28 +218,49 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 		emit("error enumerating blobs: %v", err)
 	}
 	emit("\n%d blobs marked, %d blobs and %d manifests eligible for deletion", len(markSet), len(deleteSet), len(manifestArr))
+
+	deleteBlobsG, _ := errgroup.WithContext(context.Background())
+	deleteBlobsG.SetLimit(concurrencyLimit)
 	for dgst := range deleteSet {
-		emit("blob eligible for deletion: %s", dgst)
-		if opts.DryRun {
-			continue
-		}
-		err = vacuum.RemoveBlob(string(dgst))
-		if err != nil {
-			emit("failed to delete blob %s: %v", dgst, err)
-		}
+		func(dgst digest.Digest) {
+			deleteBlobsG.Go(func() error {
+				emit("deleting blob: %s", dgst)
+				if opts.DryRun {
+					return nil
+				}
+				err = vacuum.RemoveBlob(string(dgst))
+				if err != nil {
+					emit("failed to delete blob %s: %v", dgst, err)
+				}
+				return nil
+			})
+		}(dgst)
+	}
+	if err := deleteBlobsG.Wait(); err != nil {
+		emit("error removing blobs: %v", err)
 	}
 
+	deleteLayersG, _ := errgroup.WithContext(context.Background())
+	deleteLayersG.SetLimit(concurrencyLimit)
 	for repo, dgsts := range deleteLayerSet {
 		for _, dgst := range dgsts {
-			emit("%s: layer link eligible for deletion: %s", repo, dgst)
-			if opts.DryRun {
-				continue
-			}
-			err = vacuum.RemoveLayer(repo, dgst)
-			if err != nil {
-				emit("failed to delete layer link %s of repo %s: %v", dgst, repo, err)
-			}
+			func(dgst digest.Digest) {
+				deleteLayersG.Go(func() error {
+					emit("%s: layer link eligible for deletion: %s", repo, dgst)
+					if opts.DryRun {
+						return nil
+					}
+					err = vacuum.RemoveLayer(repo, dgst)
+					if err != nil {
+						emit("failed to delete layer link %s of repo %s: %v", dgst, repo, err)
+					}
+					return nil
+				})
+			}(dgst)
 		}
+	}
+	if err := deleteLayersG.Wait(); err != nil {
+		emit("error deleting layers: %v", err)
 	}
 
 	return err
